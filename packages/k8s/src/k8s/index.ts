@@ -37,6 +37,7 @@ const k8sBatchV1Api = kc.makeApiClient(k8s.BatchV1Api)
 const k8sAuthorizationV1Api = kc.makeApiClient(k8s.AuthorizationV1Api)
 
 const DEFAULT_WAIT_FOR_POD_TIME_SECONDS = 10 * 60 // 10 min
+const DEFAULT_AUTH_CHECK_TIMEOUT_SECONDS = 30
 
 export const requiredPermissions = [
   {
@@ -889,24 +890,34 @@ export async function getPodStatus(
 }
 
 export async function isAuthPermissionsOK(): Promise<boolean> {
-  const sar = new k8s.V1SelfSubjectAccessReview()
-  const asyncs: Promise<k8s.V1SelfSubjectAccessReview>[] = []
-  for (const resource of requiredPermissions) {
-    for (const verb of resource.verbs) {
-      sar.spec = new k8s.V1SelfSubjectAccessReviewSpec()
-      sar.spec.resourceAttributes = new k8s.V1ResourceAttributes()
-      sar.spec.resourceAttributes.verb = verb
-      sar.spec.resourceAttributes.namespace = namespace()
-      sar.spec.resourceAttributes.group = resource.group
-      sar.spec.resourceAttributes.resource = resource.resource
-      sar.spec.resourceAttributes.subresource = resource.subresource
-      asyncs.push(
-        k8sAuthorizationV1Api.createSelfSubjectAccessReview({ body: sar })
+  const backOffManager = new BackOffManager(DEFAULT_AUTH_CHECK_TIMEOUT_SECONDS)
+  while (true) {
+    try {
+      const asyncs: Promise<k8s.V1SelfSubjectAccessReview>[] = []
+      for (const resource of requiredPermissions) {
+        for (const verb of resource.verbs) {
+          const sar = new k8s.V1SelfSubjectAccessReview()
+          sar.spec = new k8s.V1SelfSubjectAccessReviewSpec()
+          sar.spec.resourceAttributes = new k8s.V1ResourceAttributes()
+          sar.spec.resourceAttributes.verb = verb
+          sar.spec.resourceAttributes.namespace = namespace()
+          sar.spec.resourceAttributes.group = resource.group
+          sar.spec.resourceAttributes.resource = resource.resource
+          sar.spec.resourceAttributes.subresource = resource.subresource
+          asyncs.push(
+            k8sAuthorizationV1Api.createSelfSubjectAccessReview({ body: sar })
+          )
+        }
+      }
+      const responses = await Promise.all(asyncs)
+      return responses.every(resp => resp.status?.allowed)
+    } catch (error) {
+      core.warning(
+        `isAuthPermissionsOK: SSAR check failed, retrying: ${formatError(error)}`
       )
+      await backOffManager.backOff()
     }
   }
-  const responses = await Promise.all(asyncs)
-  return responses.every(resp => resp.status?.allowed)
 }
 
 export async function isPodContainerAlpine(
