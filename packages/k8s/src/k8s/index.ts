@@ -248,7 +248,45 @@ export async function deletePod(name: string): Promise<void> {
   })
 }
 
+// Thrown only when exec.exec() fails to establish the connection (e.g. the
+// API server can't dial the kubelet: "No agent available"), before any
+// command has started running in the container. Distinguishing this from a
+// resp-callback failure (the command ran and failed/exited non-zero) is what
+// makes it safe to retry: nothing executed yet, so nothing double-runs.
+class ExecConnectionError extends Error {}
+
+const NO_AGENT_AVAILABLE_MAX_ATTEMPTS = 5
+
 export async function execPodStep(
+  command: string[],
+  podName: string,
+  containerName: string,
+  stdin?: stream.Readable
+): Promise<number> {
+  const backOffManager = new BackOffManager()
+  let attempt = 0
+  while (true) {
+    try {
+      return await execPodStepOnce(command, podName, containerName, stdin)
+    } catch (error) {
+      attempt++
+      if (
+        !(error instanceof ExecConnectionError) ||
+        !/no agent available/i.test(formatError(error)) ||
+        attempt >= NO_AGENT_AVAILABLE_MAX_ATTEMPTS
+      ) {
+        throw error
+      }
+      core.warning(
+        `[execPodStep] connection setup failed ("No agent available"), ` +
+          `retrying (attempt ${attempt}/${NO_AGENT_AVAILABLE_MAX_ATTEMPTS}): ${formatError(error)}`
+      )
+      await backOffManager.backOff()
+    }
+  }
+}
+
+async function execPodStepOnce(
   command: string[],
   podName: string,
   containerName: string,
@@ -367,7 +405,15 @@ export async function execPodStep(
           })
         }
 
-        reject(e)
+        // ws is only assigned once exec.exec() resolves and the .then above
+        // has run — if it's still null here, exec.exec() itself rejected
+        // before a connection was ever established, i.e. nothing has run in
+        // the container yet. Only that case is safe for the caller to retry.
+        if (ws === null) {
+          reject(new ExecConnectionError(formatError(e)))
+        } else {
+          reject(e)
+        }
       })
   })
 }
