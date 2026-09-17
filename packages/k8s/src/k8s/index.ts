@@ -253,7 +253,16 @@ export async function deletePod(name: string): Promise<void> {
 // command has started running in the container. Distinguishing this from a
 // resp-callback failure (the command ran and failed/exited non-zero) is what
 // makes it safe to retry: nothing executed yet, so nothing double-runs.
-class ExecConnectionError extends Error {}
+class ExecConnectionError extends Error {
+  constructor(message?: string) {
+    super(message)
+    // This repo compiles to ES5 (see tsconfig.json), where extending a
+    // built-in like Error breaks the prototype chain unless restored
+    // manually — without this, `instanceof ExecConnectionError` is always
+    // false and the retry below never fires.
+    Object.setPrototypeOf(this, ExecConnectionError.prototype)
+  }
+}
 
 const NO_AGENT_AVAILABLE_MAX_ATTEMPTS = 5
 
