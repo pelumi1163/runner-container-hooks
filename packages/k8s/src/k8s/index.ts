@@ -234,7 +234,16 @@ export async function deletePod(name: string): Promise<void> {
 // exit) — so every rejection here is, by construction, a connection-setup
 // failure. That's what makes it safe to retry: nothing executed yet, so
 // nothing double-runs.
-class ExecConnectionError extends Error {}
+class ExecConnectionError extends Error {
+  constructor(message?: string) {
+    super(message)
+    // This repo compiles to ES5 (see tsconfig.json), where extending a
+    // built-in like Error breaks the prototype chain unless restored
+    // manually — without this, `instanceof ExecConnectionError` is always
+    // false and the retry above never fires.
+    Object.setPrototypeOf(this, ExecConnectionError.prototype)
+  }
+}
 
 const NO_AGENT_AVAILABLE_MAX_ATTEMPTS = 5
 
