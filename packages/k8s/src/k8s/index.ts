@@ -12,6 +12,7 @@ import {
 } from '../hooks/constants'
 import {
   PodPhase,
+  formatError,
   mergePodSpecWithOptions,
   mergeObjectMeta,
   useKubeScheduler,
@@ -271,7 +272,7 @@ export async function waitForJobToComplete(jobName: string): Promise<void> {
         return
       }
     } catch (error) {
-      throw new Error(`job ${jobName} has failed: ${JSON.stringify(error)}`)
+      throw new Error(`job ${jobName} has failed: ${formatError(error)}`)
     }
     await backOffManager.backOff()
   }
@@ -394,7 +395,7 @@ export async function waitForPodPhases(
     }
   } catch (error) {
     throw new Error(
-      `Pod ${podName} is unhealthy with phase status ${phase}: ${JSON.stringify(error)}`
+      `Pod ${podName} is unhealthy with phase status ${phase}: ${formatError(error)}`
     )
   }
 }
