@@ -29,6 +29,7 @@ const k8sAuthorizationV1Api = kc.makeApiClient(k8s.AuthorizationV1Api)
 
 const DEFAULT_WAIT_FOR_POD_TIME_SECONDS = 10 * 60 // 10 min
 const DEFAULT_AUTH_CHECK_TIMEOUT_SECONDS = 30
+const SSAR_REQUEST_TIMEOUT_SECONDS = 5
 
 export const POD_VOLUME_NAME = 'work'
 
@@ -499,6 +500,18 @@ export async function getPodStatus(
   return pod.status
 }
 
+function withTimeout<T>(promise: Promise<T>, seconds: number): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) =>
+      setTimeout(
+        () => reject(new Error(`request timed out after ${seconds}s`)),
+        seconds * 1000
+      )
+    )
+  ])
+}
+
 export async function isAuthPermissionsOK(): Promise<boolean> {
   const backOffManager = new BackOffManager(DEFAULT_AUTH_CHECK_TIMEOUT_SECONDS)
   while (true) {
@@ -515,7 +528,12 @@ export async function isAuthPermissionsOK(): Promise<boolean> {
           sar.spec.resourceAttributes.resource = resource.resource
           sar.spec.resourceAttributes.subresource = resource.subresource
           asyncs.push(
-            k8sAuthorizationV1Api.createSelfSubjectAccessReview({ body: sar })
+            withTimeout(
+              k8sAuthorizationV1Api.createSelfSubjectAccessReview({
+                body: sar
+              }),
+              SSAR_REQUEST_TIMEOUT_SECONDS
+            )
           )
         }
       }
