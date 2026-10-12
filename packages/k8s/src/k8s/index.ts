@@ -226,7 +226,48 @@ export async function deletePod(name: string): Promise<void> {
   })
 }
 
+// Thrown only when exec.exec() fails to establish the connection (e.g. the
+// API server can't dial the kubelet: "No agent available"), before any
+// command has started running in the container. In this implementation,
+// nothing else can reach this .catch — the resp callback below settles the
+// promise directly for every post-connection outcome (success or non-zero
+// exit) — so every rejection here is, by construction, a connection-setup
+// failure. That's what makes it safe to retry: nothing executed yet, so
+// nothing double-runs.
+class ExecConnectionError extends Error {}
+
+const NO_AGENT_AVAILABLE_MAX_ATTEMPTS = 5
+
 export async function execPodStep(
+  command: string[],
+  podName: string,
+  containerName: string,
+  stdin?: stream.Readable
+): Promise<void> {
+  const backOffManager = new BackOffManager()
+  let attempt = 0
+  while (true) {
+    try {
+      return await execPodStepOnce(command, podName, containerName, stdin)
+    } catch (error) {
+      attempt++
+      if (
+        !(error instanceof ExecConnectionError) ||
+        !/no agent available/i.test(formatError(error)) ||
+        attempt >= NO_AGENT_AVAILABLE_MAX_ATTEMPTS
+      ) {
+        throw error
+      }
+      core.warning(
+        `[execPodStep] connection setup failed ("No agent available"), ` +
+          `retrying (attempt ${attempt}/${NO_AGENT_AVAILABLE_MAX_ATTEMPTS}): ${formatError(error)}`
+      )
+      await backOffManager.backOff()
+    }
+  }
+}
+
+async function execPodStepOnce(
   command: string[],
   podName: string,
   containerName: string,
@@ -262,7 +303,7 @@ export async function execPodStep(
         }
       )
       // If exec.exec fails, explicitly reject the outer promise
-      .catch(e => reject(e))
+      .catch(e => reject(new ExecConnectionError(formatError(e))))
   })
 }
 
