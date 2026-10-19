@@ -226,14 +226,15 @@ export async function deletePod(name: string): Promise<void> {
   })
 }
 
-// Thrown only when exec.exec() fails to establish the connection (e.g. the
-// API server can't dial the kubelet: "No agent available"), before any
-// command has started running in the container. In this implementation,
-// nothing else can reach this .catch — the resp callback below settles the
-// promise directly for every post-connection outcome (success or non-zero
-// exit) — so every rejection here is, by construction, a connection-setup
-// failure. That's what makes it safe to retry: nothing executed yet, so
-// nothing double-runs.
+// Thrown only when we can prove the exec never produced any container
+// output — i.e. nothing ran yet, so retrying can't double-execute a
+// non-idempotent command. Two call sites construct this:
+//   - exec.exec() itself rejecting (the connection was never established)
+//   - the resp callback reporting a Failure status while zero bytes were
+//     ever written to stdout/stderr (the API server can report a dial
+//     failure like "No agent available" *after* nominally accepting the
+//     exec request, via this callback instead of a promise rejection —
+//     but if nothing was ever printed, the command still never started)
 class ExecConnectionError extends Error {
   constructor(message?: string) {
     super(message)
@@ -276,6 +277,22 @@ export async function execPodStep(
   }
 }
 
+// Forwards to `target` unchanged, while recording whether any bytes ever
+// passed through — the only reliable way to know if the exec'd command
+// produced output, since exec.exec() takes the destination streams directly.
+function trackedOutput(target: NodeJS.WritableStream): {
+  stream: stream.PassThrough
+  hasOutput: () => boolean
+} {
+  let received = false
+  const passthrough = new stream.PassThrough()
+  passthrough.on('data', () => {
+    received = true
+  })
+  passthrough.pipe(target)
+  return { stream: passthrough, hasOutput: () => received }
+}
+
 async function execPodStepOnce(
   command: string[],
   podName: string,
@@ -284,6 +301,9 @@ async function execPodStepOnce(
 ): Promise<void> {
   const exec = new k8s.Exec(kc)
   command = fixArgs(command)
+  const stdout = trackedOutput(process.stdout)
+  const stderr = trackedOutput(process.stderr)
+  const hasOutput = (): boolean => stdout.hasOutput() || stderr.hasOutput()
   // Exec returns a websocket. If websocket fails, we should reject the promise. Otherwise, websocket will call a callback. Since at that point, websocket is not failing, we can safely resolve or reject the promise.
   await new Promise(function (resolve, reject) {
     exec
@@ -292,8 +312,8 @@ async function execPodStepOnce(
         podName,
         containerName,
         command,
-        process.stdout,
-        process.stderr,
+        stdout.stream,
+        stderr.stream,
         stdin ?? null,
         false /* tty */,
         resp => {
@@ -307,7 +327,16 @@ async function execPodStepOnce(
                 details: resp?.details
               })
             )
-            reject(resp?.message)
+            // No output yet means the command never started, so a dial
+            // failure reported here is safe to retry the same way as a
+            // connection-setup failure. Gate on the message too, not just
+            // hasOutput() — anything else (e.g. a real "command not found"
+            // with no output) keeps its original rejection value unchanged.
+            if (!hasOutput() && /no agent available/i.test(formatError(resp?.message))) {
+              reject(new ExecConnectionError(formatError(resp?.message)))
+            } else {
+              reject(resp?.message)
+            }
           }
         }
       )
