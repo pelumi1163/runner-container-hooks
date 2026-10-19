@@ -130,10 +130,42 @@ export async function createPod(
     mergePodSpecWithOptions(appPod.spec, extension.spec)
   }
 
-  return await k8sApi.createNamespacedPod({
-    namespace: namespace(),
-    body: appPod
-  })
+  return await createPodWithRetry(appPod)
+}
+
+const CREATE_POD_MAX_BACKOFF_SECONDS = 60
+
+// createNamespacedPod is a POST with a deterministic, caller-chosen pod
+// name (getJobPodName()) — a connection error here doesn't tell us whether
+// the request ever reached the server. If it did, the pod now exists and a
+// naive retry would hit a 409 forever. Treat "already exists" as success
+// (adopt the pod a prior attempt created) instead of failing or looping.
+async function createPodWithRetry(appPod: k8s.V1Pod): Promise<k8s.V1Pod> {
+  const backOffManager = new BackOffManager(CREATE_POD_MAX_BACKOFF_SECONDS)
+  while (true) {
+    try {
+      return await k8sApi.createNamespacedPod({
+        namespace: namespace(),
+        body: appPod
+      })
+    } catch (error) {
+      if (error instanceof k8s.ApiException && error.code === 409) {
+        core.warning(
+          `[createPod] pod ${appPod.metadata?.name} already exists ` +
+            `(a prior attempt likely created it before its response was lost); ` +
+            `using the existing pod instead of failing.`
+        )
+        return await k8sApi.readNamespacedPod({
+          name: appPod.metadata?.name as string,
+          namespace: namespace()
+        })
+      }
+      core.warning(
+        `[createPod] failed to create job pod, retrying: ${formatError(error)}`
+      )
+      await backOffManager.backOff()
+    }
+  }
 }
 
 export async function createJob(
@@ -462,7 +494,19 @@ export async function waitForPodPhases(
   let phase: PodPhase = PodPhase.UNKNOWN
   try {
     while (true) {
-      phase = await getPodPhase(podName)
+      try {
+        phase = await getPodPhase(podName)
+      } catch (error) {
+        // A transient failure fetching pod status (e.g. a brief API server
+        // connectivity blip) isn't the same as the pod being unhealthy —
+        // retry it with the same backoff budget instead of failing the
+        // job on one bad network moment.
+        core.warning(
+          `[waitForPodPhases] failed to fetch pod status, retrying: ${formatError(error)}`
+        )
+        await backOffManager.backOff()
+        continue
+      }
       if (awaitingPhases.has(phase)) {
         return
       }
@@ -572,11 +616,21 @@ export async function prunePods(): Promise<void> {
 export async function getPodStatus(
   name: string
 ): Promise<k8s.V1PodStatus | undefined> {
-  const pod = await k8sApi.readNamespacedPod({
-    name,
-    namespace: namespace()
-  })
-  return pod.status
+  const backOffManager = new BackOffManager(30)
+  while (true) {
+    try {
+      const pod = await k8sApi.readNamespacedPod({
+        name,
+        namespace: namespace()
+      })
+      return pod.status
+    } catch (error) {
+      core.warning(
+        `[getPodStatus] failed to read pod status, retrying: ${formatError(error)}`
+      )
+      await backOffManager.backOff()
+    }
+  }
 }
 
 function withTimeout<T>(promise: Promise<T>, seconds: number): Promise<T> {
