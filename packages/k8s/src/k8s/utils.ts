@@ -165,6 +165,50 @@ exec ${environmentPrefix} ${entryPoint} ${
   }
 }
 
+// Generates a launcher that runs `entryPointContainerPath` detached
+// (setsid) from the exec session that starts it, logging to a file on the
+// shared work volume instead of streaming straight to the exec connection.
+// Re-invoking the launcher is idempotent: if the job already started, it
+// never restarts it — it only resumes tailing the log from the given byte
+// offset until the exit-code file appears. This lets execDetachedScriptStep
+// survive a dropped connection mid-script without replaying the step.
+export function writeDetachedLauncherScript(entryPointContainerPath: string): {
+  containerPath: string
+  runnerPath: string
+} {
+  const id = uuidv4()
+  const logPath = `/__w/_temp/${id}.log`
+  const pidPath = `/__w/_temp/${id}.pid`
+  const exitPath = `/__w/_temp/${id}.exit`
+
+  const content = `#!/bin/sh -l
+OFFSET="\${1:-0}"
+
+if [ ! -f "${pidPath}" ] && [ ! -f "${exitPath}" ]; then
+  : > "${logPath}"
+  setsid sh -c 'sh -e "${entryPointContainerPath}" >"${logPath}" 2>&1; echo $? >"${exitPath}"' </dev/null &
+  echo $! > "${pidPath}"
+fi
+
+tail -c +"$((OFFSET + 1))" -f "${logPath}" &
+TAILPID=$!
+while [ ! -f "${exitPath}" ]; do
+  sleep 1
+done
+sleep 1
+kill "$TAILPID" 2>/dev/null
+wait "$TAILPID" 2>/dev/null
+exit "$(cat "${exitPath}")"
+`
+  const filename = `${id}-launcher.sh`
+  const launcherPath = `${process.env.RUNNER_TEMP}/${filename}`
+  fs.writeFileSync(launcherPath, content)
+  return {
+    containerPath: `/__w/_temp/${filename}`,
+    runnerPath: launcherPath
+  }
+}
+
 export function generateContainerName(image: string): string {
   const nameWithTag = image.split('/').pop()
   const name = nameWithTag?.split(':')[0]

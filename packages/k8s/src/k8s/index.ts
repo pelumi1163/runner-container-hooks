@@ -268,13 +268,18 @@ export async function deletePod(name: string): Promise<void> {
 //     exec request, via this callback instead of a promise rejection —
 //     but if nothing was ever printed, the command still never started)
 class ExecConnectionError extends Error {
-  constructor(message?: string) {
+  // Bytes already streamed to stdout/stderr before this error, when known.
+  // Only set by execLauncherOnce, so execDetachedScriptStep's retry can
+  // resume its tail from the right byte offset instead of replaying output.
+  bytesStreamed?: number
+  constructor(message?: string, bytesStreamed?: number) {
     super(message)
     // This repo compiles to ES5 (see tsconfig.json), where extending a
     // built-in like Error breaks the prototype chain unless restored
     // manually — without this, `instanceof ExecConnectionError` is always
     // false and the retry above never fires.
     Object.setPrototypeOf(this, ExecConnectionError.prototype)
+    this.bytesStreamed = bytesStreamed
   }
 }
 
@@ -375,6 +380,130 @@ async function execPodStepOnce(
       // If exec.exec fails, explicitly reject the outer promise
       .catch(e => reject(new ExecConnectionError(formatError(e))))
   })
+}
+
+// Like trackedOutput(), but counts bytes instead of a boolean — used by
+// execDetachedScriptStep to know what byte offset a reconnect's launcher
+// invocation should resume tailing from.
+function countedOutput(target: NodeJS.WritableStream): {
+  stream: stream.PassThrough
+  byteCount: () => number
+} {
+  let count = 0
+  const passthrough = new stream.PassThrough()
+  passthrough.on('data', chunk => {
+    count += chunk.length
+  })
+  passthrough.pipe(target)
+  return { stream: passthrough, byteCount: () => count }
+}
+
+// A connection that goes silent without the client-node library ever
+// invoking the resp callback (no close/error status) would otherwise hang
+// a detached-script step forever — this bounds that.
+const DETACHED_SCRIPT_IDLE_TIMEOUT_SECONDS = 120
+const DETACHED_SCRIPT_MAX_ATTEMPTS = 10
+
+async function execLauncherOnce(
+  command: string[],
+  podName: string,
+  containerName: string
+): Promise<void> {
+  const exec = new k8s.Exec(kc)
+  const fixedCommand = fixArgs(command)
+  const stdout = countedOutput(process.stdout)
+  const stderr = countedOutput(process.stderr)
+  const totalBytes = (): number => stdout.byteCount() + stderr.byteCount()
+
+  let idleTimer: ReturnType<typeof setTimeout> | undefined
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const resetIdleTimer = (): void => {
+        clearTimeout(idleTimer)
+        idleTimer = setTimeout(() => {
+          reject(
+            new ExecConnectionError(
+              `no output for ${DETACHED_SCRIPT_IDLE_TIMEOUT_SECONDS}s, assuming dropped connection`,
+              totalBytes()
+            )
+          )
+        }, DETACHED_SCRIPT_IDLE_TIMEOUT_SECONDS * 1000)
+      }
+      resetIdleTimer()
+      stdout.stream.on('data', resetIdleTimer)
+      stderr.stream.on('data', resetIdleTimer)
+
+      exec
+        .exec(
+          namespace(),
+          podName,
+          containerName,
+          fixedCommand,
+          stdout.stream,
+          stderr.stream,
+          null,
+          false /* tty */,
+          resp => {
+            if (resp.status === 'Success') {
+              resolve()
+            } else if (/no agent available/i.test(formatError(resp?.message))) {
+              reject(new ExecConnectionError(formatError(resp?.message), totalBytes()))
+            } else {
+              reject(resp?.message)
+            }
+          }
+        )
+        .catch(e => reject(new ExecConnectionError(formatError(e), totalBytes())))
+    })
+  } finally {
+    clearTimeout(idleTimer)
+    // Each attempt pipes a fresh PassThrough into process.stdout/stderr;
+    // without unpiping, a step that retries several times (up to
+    // DETACHED_SCRIPT_MAX_ATTEMPTS) leaks listeners onto those long-lived,
+    // process-wide streams for the rest of the hook process's life.
+    stdout.stream.unpipe(process.stdout)
+    stderr.stream.unpipe(process.stderr)
+  }
+}
+
+// Runs a detached-launcher script (see writeDetachedLauncherScript) for a
+// job's script step. Unlike execPodStep, a connection drop is retried
+// *regardless* of whether output was already seen — re-invoking the launcher
+// never replays the user's script, it only resumes watching a process that
+// is already running detached from this exec session.
+export async function execDetachedScriptStep(
+  launcherContainerPath: string,
+  podName: string,
+  containerName: string
+): Promise<void> {
+  const backOffManager = new BackOffManager()
+  let offset = 0
+  let attempt = 0
+  while (true) {
+    try {
+      return await execLauncherOnce(
+        ['sh', launcherContainerPath, String(offset)],
+        podName,
+        containerName
+      )
+    } catch (error) {
+      attempt++
+      if (
+        !(error instanceof ExecConnectionError) ||
+        attempt >= DETACHED_SCRIPT_MAX_ATTEMPTS
+      ) {
+        throw error
+      }
+      if (typeof error.bytesStreamed === 'number') {
+        offset += error.bytesStreamed
+      }
+      core.warning(
+        `[execDetachedScriptStep] connection dropped mid-stream, resuming from byte ` +
+          `offset ${offset} (attempt ${attempt}/${DETACHED_SCRIPT_MAX_ATTEMPTS}): ${formatError(error)}`
+      )
+      await backOffManager.backOff()
+    }
+  }
 }
 
 export async function waitForJobToComplete(jobName: string): Promise<void> {

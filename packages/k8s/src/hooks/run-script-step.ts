@@ -2,8 +2,12 @@
 import * as fs from 'fs'
 import * as core from '@actions/core'
 import { RunScriptStepArgs } from 'hooklib'
-import { execPodStep } from '../k8s'
-import { formatError, writeEntryPointScript } from '../k8s/utils'
+import { execDetachedScriptStep } from '../k8s'
+import {
+  formatError,
+  writeEntryPointScript,
+  writeDetachedLauncherScript
+} from '../k8s/utils'
 import { JOB_CONTAINER_NAME } from './constants'
 
 export async function runScriptStep(
@@ -19,20 +23,20 @@ export async function runScriptStep(
     args.prependPath,
     environmentVariables
   )
+  const launcher = writeDetachedLauncherScript(containerPath)
 
-  args.entryPoint = 'sh'
-  args.entryPointArgs = ['-e', containerPath]
   try {
-    await execPodStep(
-      [args.entryPoint, ...args.entryPointArgs],
+    await execDetachedScriptStep(
+      launcher.containerPath,
       state.jobPod,
       JOB_CONTAINER_NAME
     )
   } catch (err) {
     const message = formatError(err)
-    core.debug(`execPodStep failed: ${message}`)
+    core.debug(`execDetachedScriptStep failed: ${message}`)
     throw new Error(`failed to run script step: ${message}`)
   } finally {
     fs.rmSync(runnerPath)
+    fs.rmSync(launcher.runnerPath)
   }
 }
