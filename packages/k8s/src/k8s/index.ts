@@ -18,6 +18,11 @@ import {
   useKubeScheduler,
   fixArgs
 } from './utils'
+import {
+  parsePositiveMsEnv,
+  WebSocketHeartbeat,
+  HeartbeatWebSocket
+} from './heartbeat'
 
 const kc = new k8s.KubeConfig()
 
@@ -398,10 +403,6 @@ function countedOutput(target: NodeJS.WritableStream): {
   return { stream: passthrough, byteCount: () => count }
 }
 
-// A connection that goes silent without the client-node library ever
-// invoking the resp callback (no close/error status) would otherwise hang
-// a detached-script step forever — this bounds that.
-const DETACHED_SCRIPT_IDLE_TIMEOUT_SECONDS = 120
 const DETACHED_SCRIPT_MAX_ATTEMPTS = 10
 
 async function execLauncherOnce(
@@ -415,23 +416,27 @@ async function execLauncherOnce(
   const stderr = countedOutput(process.stderr)
   const totalBytes = (): number => stdout.byteCount() + stderr.byteCount()
 
-  let idleTimer: ReturnType<typeof setTimeout> | undefined
+  // Pings over the exec websocket itself, independent of whether the
+  // script is producing stdout/stderr — a long silent-but-healthy step
+  // (e.g. a quiet compile) must never be mistaken for a dead connection,
+  // which a stdout-based idle timer can't tell apart on its own.
+  const pingPeriodMs = parsePositiveMsEnv(
+    process.env.ACTIONS_RUNNER_HEARTBEAT_PERIOD_MS,
+    5000
+  )
+  const pongDeadlineMs = parsePositiveMsEnv(
+    process.env.ACTIONS_RUNNER_HEARTBEAT_DEADLINE_MS,
+    pingPeriodMs * 12 + 1000
+  )
+  const heartbeat = new WebSocketHeartbeat(pingPeriodMs, pongDeadlineMs)
+  let ws: HeartbeatWebSocket | null = null
+
   try {
     await new Promise<void>((resolve, reject) => {
-      const resetIdleTimer = (): void => {
-        clearTimeout(idleTimer)
-        idleTimer = setTimeout(() => {
-          reject(
-            new ExecConnectionError(
-              `no output for ${DETACHED_SCRIPT_IDLE_TIMEOUT_SECONDS}s, assuming dropped connection`,
-              totalBytes()
-            )
-          )
-        }, DETACHED_SCRIPT_IDLE_TIMEOUT_SECONDS * 1000)
+      const rejectConnectionError = (err: unknown): void => {
+        heartbeat.stop()
+        reject(new ExecConnectionError(formatError(err), totalBytes()))
       }
-      resetIdleTimer()
-      stdout.stream.on('data', resetIdleTimer)
-      stderr.stream.on('data', resetIdleTimer)
 
       exec
         .exec(
@@ -444,6 +449,7 @@ async function execLauncherOnce(
           null,
           false /* tty */,
           resp => {
+            heartbeat.stop()
             if (resp.status === 'Success') {
               resolve()
             } else if (/no agent available/i.test(formatError(resp?.message))) {
@@ -453,10 +459,16 @@ async function execLauncherOnce(
             }
           }
         )
-        .catch(e => reject(new ExecConnectionError(formatError(e), totalBytes())))
+        .then(websocket => {
+          ws = websocket
+          if (ws) {
+            heartbeat.start(ws, rejectConnectionError)
+          }
+        })
+        .catch(e => rejectConnectionError(e))
     })
   } finally {
-    clearTimeout(idleTimer)
+    heartbeat.stop()
     // Each attempt pipes a fresh PassThrough into process.stdout/stderr;
     // without unpiping, a step that retries several times (up to
     // DETACHED_SCRIPT_MAX_ATTEMPTS) leaks listeners onto those long-lived,

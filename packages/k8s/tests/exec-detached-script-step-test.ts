@@ -7,6 +7,13 @@
 // (see writeDetachedLauncherScript) never replays the user's command — it
 // only resumes tailing a process that is already running detached from the
 // exec session that started it.
+//
+// A dead connection is detected via WebSocketHeartbeat (ping/pong over the
+// exec websocket itself), not by inferring it from a lack of stdout/stderr
+// bytes — a silent-but-healthy step must never be mistaken for a dropped
+// connection.
+
+import { EventEmitter } from 'events'
 
 const mockExecFn = jest.fn()
 
@@ -32,7 +39,13 @@ jest.mock('@kubernetes/client-node', () => ({
 import * as core from '@actions/core'
 import { execDetachedScriptStep } from '../src/k8s'
 
-const MOCK_WEBSOCKET = {}
+// Minimal WebSocket test double — exec.exec() resolves with this, and
+// WebSocketHeartbeat attaches ping/pong/close listeners to it.
+class MockWebSocket extends EventEmitter {
+  readyState = 1 // OPEN
+  ping = jest.fn()
+  close = jest.fn()
+}
 
 // args passed to exec.exec(namespace, pod, container, command, stdout,
 // stderr, stdin, tty, callback)
@@ -55,6 +68,10 @@ function stdoutArg(args: unknown[]): NodeJS.WritableStream {
 describe('execDetachedScriptStep', () => {
   beforeEach(() => {
     process.env.ACTIONS_RUNNER_KUBERNETES_NAMESPACE = 'test-ns'
+    // Small but not instant, so the near-zero-delay resp callbacks used by
+    // most tests settle before any ping ever fires.
+    process.env.ACTIONS_RUNNER_HEARTBEAT_PERIOD_MS = '1000'
+    process.env.ACTIONS_RUNNER_HEARTBEAT_DEADLINE_MS = '2000'
     jest.useFakeTimers()
     mockExecFn.mockReset()
   })
@@ -69,7 +86,7 @@ describe('execDetachedScriptStep', () => {
       out.write('hello from the job\n')
       const callback = callbackArg(args)
       setTimeout(() => callback({ status: 'Success', code: 0 }), 0)
-      return Promise.resolve(MOCK_WEBSOCKET)
+      return Promise.resolve(new MockWebSocket())
     })
 
     const promise = execDetachedScriptStep(
@@ -102,12 +119,12 @@ describe('execDetachedScriptStep', () => {
             }),
           0
         )
-        return Promise.resolve(MOCK_WEBSOCKET)
+        return Promise.resolve(new MockWebSocket())
       })
       .mockImplementationOnce((...args) => {
         const callback = callbackArg(args)
         setTimeout(() => callback({ status: 'Success', code: 0 }), 0)
-        return Promise.resolve(MOCK_WEBSOCKET)
+        return Promise.resolve(new MockWebSocket())
       })
 
     const promise = execDetachedScriptStep(
@@ -126,13 +143,13 @@ describe('execDetachedScriptStep', () => {
     )
   })
 
-  it('treats a silent connection (no callback at all) as a drop via the idle timeout', async () => {
+  it('treats a connection with no pong response as a drop via the heartbeat timeout', async () => {
     mockExecFn
-      .mockImplementationOnce(() => Promise.resolve(MOCK_WEBSOCKET)) // never calls back
+      .mockImplementationOnce(() => Promise.resolve(new MockWebSocket())) // OPEN, never emits 'pong', resp callback never fires
       .mockImplementationOnce((...args) => {
         const callback = callbackArg(args)
         setTimeout(() => callback({ status: 'Success', code: 0 }), 0)
-        return Promise.resolve(MOCK_WEBSOCKET)
+        return Promise.resolve(new MockWebSocket())
       })
 
     const promise = execDetachedScriptStep(
@@ -140,10 +157,14 @@ describe('execDetachedScriptStep', () => {
       'pod-1',
       'job'
     )
-    await jest.advanceTimersByTimeAsync(130000)
+    // period=1000 (first ping) + deadline=2000 (from that ping) = 3000ms
+    await jest.advanceTimersByTimeAsync(5000)
 
     await expect(promise).resolves.toBeUndefined()
     expect(mockExecFn).toHaveBeenCalledTimes(2)
+    expect(core.warning).toHaveBeenCalledWith(
+      expect.stringContaining('heartbeat timeout')
+    )
   })
 
   it('does not retry a genuine nonzero-exit failure from the script', async () => {
@@ -157,7 +178,7 @@ describe('execDetachedScriptStep', () => {
           }),
         0
       )
-      return Promise.resolve(MOCK_WEBSOCKET)
+      return Promise.resolve(new MockWebSocket())
     })
 
     const promise = execDetachedScriptStep(
